@@ -1,0 +1,297 @@
+name: Annotation Pipeline CI/CD
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+  # Run when a new annotation file is pushed to the annotations/ folder
+  workflow_dispatch:
+    inputs:
+      annotation_file:
+        description: "Path to annotation JSON to process (relative to repo root)"
+        required: false
+        type: string
+      run_merge:
+        description: "Merge all annotation files in annotations/incoming/"
+        required: false
+        type: boolean
+        default: false
+
+# Prevent concurrent runs on the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 1. Lint & Unit Tests ────────────────────────────────────────────────────
+  test:
+    name: "Lint + Unit Tests"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Lint with ruff
+        run: ruff check annotation_pipeline/ tests/
+
+      - name: Type-check with mypy
+        run: mypy annotation_pipeline/ --ignore-missing-imports
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ -v \
+            --tb=short \
+            --cov=annotation_pipeline \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --junitxml=test-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results.xml
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          file: coverage.xml
+          fail_ci_if_error: false
+
+  # ── 2. Validate incoming annotation files ──────────────────────────────────
+  validate-annotations:
+    name: "Validate Annotation Files"
+    runs-on: ubuntu-latest
+    needs: test
+    if: >
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Find changed annotation files
+        id: changed-files
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ -n "${{ github.event.inputs.annotation_file }}" ]; then
+            echo "files=${{ github.event.inputs.annotation_file }}" >> $GITHUB_OUTPUT
+          else
+            FILES=$(git diff --name-only HEAD~1 HEAD -- '*.json' \
+              | grep -E 'annotation|via_project' || true)
+            echo "files=$FILES" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate each changed annotation file
+        if: steps.changed-files.outputs.files != ''
+        run: |
+          for f in ${{ steps.changed-files.outputs.files }}; do
+            echo "━━━━━ Validating: $f ━━━━━"
+            python -m annotation_pipeline.cli validate --input "$f" || exit 1
+          done
+
+      - name: Convert to canonical format
+        if: steps.changed-files.outputs.files != ''
+        run: |
+          mkdir -p exports/
+          for f in ${{ steps.changed-files.outputs.files }}; do
+            stem=$(basename "$f" .json)
+            python -m annotation_pipeline.cli convert \
+              --input "$f" \
+              --output "exports/${stem}_canonical.json"
+          done
+
+      - name: Upload canonical annotation artifacts
+        if: steps.changed-files.outputs.files != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: canonical-annotations-${{ github.run_number }}
+          path: exports/
+          retention-days: 30
+
+  # ── 3. Merge annotations job ───────────────────────────────────────────────
+  merge-annotations:
+    name: "Merge All Annotations"
+    runs-on: ubuntu-latest
+    needs: validate-annotations
+    if: >
+      (github.event_name == 'workflow_dispatch' &&
+       github.event.inputs.run_merge == 'true') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Find all annotation files
+        id: find-files
+        run: |
+          FILES=$(find annotations/ -name "*.json" 2>/dev/null | tr '\n' ' ' || echo "")
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+          echo "count=$(echo $FILES | wc -w)" >> $GITHUB_OUTPUT
+
+      - name: Merge annotation files
+        if: steps.find-files.outputs.count > '0'
+        run: |
+          mkdir -p merged/
+          python -m annotation_pipeline.cli merge \
+            --inputs ${{ steps.find-files.outputs.files }} \
+            --output merged/via_project_merged.json \
+            --project-name "merged_$(date +%Y%m%d)"
+
+      - name: Validate merged file
+        if: steps.find-files.outputs.count > '0'
+        run: |
+          python -m annotation_pipeline.cli validate \
+            --input merged/via_project_merged.json
+
+      - name: Upload merged annotations
+        if: steps.find-files.outputs.count > '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-annotations-${{ github.run_number }}
+          path: merged/
+          retention-days: 90
+
+      - name: Commit merged file back to repo
+        if: >
+          steps.find-files.outputs.count > '0' &&
+          github.ref == 'refs/heads/main'
+        run: |
+          git config --local user.email "ci-bot@github.com"
+          git config --local user.name "Annotation CI Bot"
+          cp merged/via_project_merged.json \
+             annotations/merged/via_project_latest.json
+          git add annotations/merged/via_project_latest.json
+          git diff --staged --quiet || \
+            git commit -m "ci: update merged annotations [skip ci]"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── 4. Generate inspection visuals ─────────────────────────────────────────
+  visual-inspection:
+    name: "Generate Visual Inspection"
+    runs-on: ubuntu-latest
+    needs: merge-annotations
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download merged annotations
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: merged-annotations-${{ github.run_number }}
+          path: merged/
+
+      - name: Generate inspection images (if images available)
+        run: |
+          ANNOTATION_FILE=""
+          if [ -f "merged/via_project_merged.json" ]; then
+            ANNOTATION_FILE="merged/via_project_merged.json"
+          elif [ -f "annotations/merged/via_project_latest.json" ]; then
+            ANNOTATION_FILE="annotations/merged/via_project_latest.json"
+          fi
+
+          if [ -n "$ANNOTATION_FILE" ] && [ -d "images/" ]; then
+            mkdir -p inspection/
+            python -m annotation_pipeline.cli inspect \
+              --input "$ANNOTATION_FILE" \
+              --image-dir images/ \
+              --output-dir inspection/ \
+              --n 5 \
+              --seed 42
+            echo "INSPECTION_DONE=true" >> $GITHUB_ENV
+          else
+            echo "Skipping visual inspection (no images directory found)"
+            echo "INSPECTION_DONE=false" >> $GITHUB_ENV
+          fi
+
+      - name: Upload inspection images
+        if: env.INSPECTION_DONE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspection-images-${{ github.run_number }}
+          path: inspection/
+          retention-days: 14
+
+  # ── 5. Release (tag-based) ─────────────────────────────────────────────────
+  release:
+    name: "Release Package"
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: pip install build twine
+
+      - name: Build package
+        run: python -m build
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
